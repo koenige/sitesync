@@ -13,17 +13,56 @@
 #v =  increase verbosity
 
 folder="$HOME/Sites"
+
+sitesync_usage() {
+	cat <<EOF
+Usage: sitesync SITE COMMAND
+       sitesync help
+
+Commands:
+  help         Show this help
+  test         Dry-run sync local -> remote
+  go           Sync local -> remote
+  init         Pull remote -> local
+  inittest     Dry-run pull remote -> local
+  command      Print rsync command (push)
+  commandinit  Print rsync command (pull)
+
+Site config in \$HOME/Sites/SITE/: .rsync-remote, .rsync-filter, optional .rsync-port
+EOF
+}
+
+if [[ -z "$1" ]]; then
+	sitesync_usage
+	exit 1
+fi
+
+if [[ "$1" == "help" || "$1" == "--help" || "$1" == "-h" ]]; then
+	sitesync_usage
+	exit 0
+fi
+
+if [[ -z "$2" ]]; then
+	sitesync_usage
+	exit 1
+fi
+
+if [[ "$2" == "help" || "$2" == "--help" || "$2" == "-h" ]]; then
+	sitesync_usage
+	exit 0
+fi
+
 if [[ ! -d "$folder/$1" ]]; then
-	echo "No site $1 available"
-	exit
+	echo "No site $1 available" >&2
+	exit 1
 fi
 if [[ ! -f "$folder/$1/.rsync-filter" ]]; then
-	echo "Missing .rsync-filter for $1"
-	exit
+	echo "Missing .rsync-filter for $1" >&2
+	exit 1
 fi
 if [[ ! -f "$folder/$1/.rsync-remote" ]]; then
-	echo "Missing .rsync-remote for $1"
-	exit
+	echo "Missing .rsync-remote for $1" >&2
+	exit 1
 fi
 if [[ ! -f "$folder/$1/.rsync-port" ]]; then
 	port=22
@@ -41,7 +80,7 @@ if [[ $2 == "test" ]] then
 	echo "-- Test run --"
 	rsync -rLtDuvcin -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="merge $folder/$1/.rsync-filter" $folder/$1/ $remote --delete | grep -E '^deleting|[^/]$|^$'
 elif [[ $2 == "inittest" ]] then
-	echo "-- Test inital run (get data from remote) --"
+	echo "-- Test initial run (get data from remote) --"
 	rsync -rLtDuvcin -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="merge $folder/$1/.rsync-filter" $remote $folder/$1/ --delete | grep -E '^deleting|[^/]$|^$'
 elif [[ $2 == "init" ]] then
 	echo "-- Inital run (get data from remote) --"
@@ -52,5 +91,9 @@ elif [[ $2 == "commandinit" ]] then
 	echo "rsync -rLtDuvcin -e 'ssh -p $port' --filter=\"merge $folder/$1/.rsync-filter\" $remote $folder/$1/ --delete | grep -E '^deleting|[^/]$|^$'"
 elif [[ $2 == "go" ]] then
 	echo "-- Site sync --"
-	rsync -rLtDuvc -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="merge $folder/$1/.rsync-filter" $folder/$1/ $remote --delete | grep -E '^deleting|[^/]$|^$' 
+	rsync -rLtDuvc -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="merge $folder/$1/.rsync-filter" $folder/$1/ $remote --delete | grep -E '^deleting|[^/]$|^$'
+else
+	echo "Unknown command: $2" >&2
+	sitesync_usage
+	exit 1
 fi
