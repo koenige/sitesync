@@ -1,6 +1,6 @@
 #!/bin/zsh
 
-# Sync local site folders to remote servers with rsync (SSH).
+# Sync local site folders to remote servers with rsync (SSH) or lftp (SFTP).
 # Copyright © 2025-2026 Gustaf Mossakowski
 # SPDX-License-Identifier: MIT
 
@@ -25,16 +25,328 @@ Commands:
   go           Sync local -> remote
   init         Pull remote -> local
   inittest     Dry-run pull remote -> local
-  command      Print rsync command (push)
-  commandinit  Print rsync command (pull)
+  command      Print sync command (push)
+  commandinit  Print sync command (pull)
+  status       Show transport and remote path
 
-Site config in \$HOME/Sites/SITE/: .rsync-remote, .rsync-filter, optional .rsync-port
+Site config in \$HOME/Sites/SITE/: .rsync-remote, .rsync-filter, optional .rsync-port, optional .rsync-identity
+SFTP sites also need an empty .rsync-sftp file (uses lftp instead of rsync over SSH)
 EOF
 }
 
 sitesync_rsync() {
 	rsync "$@" | grep -E '^deleting|[^/]$|^$'
 	return $pipestatus[1]
+}
+
+sitesync_is_sftp() {
+	[[ -f "$folder/$1/.rsync-sftp" ]]
+}
+
+sitesync_remote_parts() {
+	remote_host_part="${remote%%:*}"
+	remote_path="${remote#*:}"
+	remote_user="${remote_host_part%@*}"
+	remote_host="${remote_host_part##*@}"
+
+	if [[ -z "$remote_host_part" || "$remote_user" == "$remote_host" || -z "$remote_path" ]]; then
+		echo "Invalid .rsync-remote (expected user@host:path): $remote" >&2
+		return 1
+	fi
+}
+
+sitesync_lftp_require() {
+	if ! command -v lftp >/dev/null 2>&1; then
+		echo "lftp not found; install with: brew install lftp" >&2
+		return 1
+	fi
+}
+
+sitesync_lftp_connect_program() {
+	local site="$1"
+	local ssh_bin identity_line identity_opt connect
+
+	if [[ -z "$remote_host" ]]; then
+		sitesync_remote_parts || return 1
+	fi
+
+	ssh_bin=$(command -v ssh)
+	if [[ -z "$ssh_bin" ]]; then
+		echo "ssh not found" >&2
+		return 1
+	fi
+
+	identity_opt=""
+	if [[ -f "$folder/$site/.rsync-identity" ]]; then
+		identity_line=$(head -n 1 "$folder/$site/.rsync-identity")
+		identity_line=${identity_line//$'\r'/}
+		if [[ -n "$identity_line" ]]; then
+			identity_opt="-i \"${identity_line}\" "
+		fi
+	fi
+
+	# lftp appends -p, -l, host, and -s sftp; only pass extra ssh options here.
+	connect="${ssh_bin} -a -x ${identity_opt}-o BatchMode=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no"
+	print "set sftp:connect-program \"${connect}\""
+}
+
+sitesync_lftp_local_path() {
+	local site="$1"
+	local base="$folder/$site"
+	local subpath="${remote_path#/}"
+
+	if [[ -z "$subpath" || "$remote_path" == "/" ]]; then
+		print -r -- "$base"
+		return
+	fi
+
+	if [[ -d "$base/$subpath" ]]; then
+		print -r -- "$base/$subpath"
+		return
+	fi
+
+	print -r -- "$base"
+}
+
+sitesync_lftp_write_script() {
+	local site="$1"
+	local direction="$2"
+	local dry_run="$3"
+	local script_file="$4"
+	local local_path
+	local line pattern
+
+	if ! sitesync_remote_parts; then
+		return 1
+	fi
+
+	local_path="$(sitesync_lftp_local_path "$site")"
+
+	{
+		print "set sftp:auto-confirm yes"
+		print "set cmd:fail-exit yes"
+		print "set cache:enable no"
+		print "set net:timeout 30"
+		print "set net:max-retries 2"
+		sitesync_lftp_connect_program "$site" || return 1
+		if [[ "$port" == "22" ]]; then
+			print "open -u ${remote_user}, sftp://${remote_host}"
+		else
+			print "open -u ${remote_user}, sftp://${remote_host}:${port}"
+		fi
+		if [[ "$remote_path" != "/" ]]; then
+			print "cd \"${remote_path#/}\""
+		fi
+		print "lcd \"${local_path}\""
+
+		print -n "mirror"
+		if [[ "$direction" == push ]]; then
+			print -n " -R"
+		fi
+		if (( dry_run )); then
+			# lftp -n is --only-newer (real uploads); dry-run is --dry-run
+			print -n " --dry-run"
+		else
+			print -n " -v"
+		fi
+		print -n " --only-newer --delete"
+
+		while IFS= read -r line || [[ -n "$line" ]]; do
+			line=${line//$'\r'/}
+			if [[ -z "$line" || "$line" == \#* || "$line" != '- '* ]]; then
+				continue
+			fi
+			pattern="${line#- }"
+			pattern=${pattern#/}
+			pattern=${pattern%/}
+			if [[ -z "$pattern" ]]; then
+				continue
+			fi
+			if [[ "$pattern" == *'*'* || "$pattern" == *'?'* ]]; then
+				print -n " --exclude-glob \"${pattern}\""
+				if [[ "$pattern" == */* ]]; then
+					print -n " --exclude-glob \"${pattern%%/*}/**\""
+				fi
+			else
+				print -n " --exclude-glob \"${pattern}\""
+				print -n " --exclude-glob \"${pattern}/**\""
+			fi
+		done < "$folder/$site/.rsync-filter"
+
+		print " . ."
+		print "quit"
+	} > "$script_file"
+}
+
+sitesync_lftp_run() {
+	local site="$1"
+	local direction="$2"
+	local dry_run="$3"
+	local script_file
+	local exit_code
+
+	if ! sitesync_lftp_require; then
+		return 1
+	fi
+	if ! sitesync_remote_parts; then
+		return 1
+	fi
+
+	if [[ "$remote_path" == "/" ]]; then
+		echo "Warning: remote path is / — mirror may be very slow. Prefer a subpath in .rsync-remote (e.g. public_html)." >&2
+	fi
+
+	script_file=$(mktemp "${TMPDIR:-/tmp}/sitesync-lftp.XXXXXX") || return 1
+	if ! sitesync_lftp_write_script "$site" "$direction" "$dry_run" "$script_file"; then
+		rm -f "$script_file"
+		return 1
+	fi
+
+	# LC_ALL=C: sitesync_lftp_format only understands English lftp messages
+	LC_ALL=C lftp -f "$script_file" | sitesync_lftp_format "$direction" "$(sitesync_lftp_local_path "$site")"
+	exit_code=$pipestatus[1]
+	rm -f "$script_file"
+	return $exit_code
+}
+
+# Shorten lftp output (dry-run commands and mirror -v messages) to: ACTION PATH
+sitesync_lftp_format() {
+	local direction="$1"
+	local local_base="$2"
+	local transfer_label=upload
+	local line action target
+	local pending_delete=""
+	local count=0
+
+	if [[ "$direction" == pull ]]; then
+		transfer_label=download
+	fi
+
+	while IFS= read -r line; do
+		action=""
+		case "$line" in
+			'get -e '*)
+				action=update
+				target=$(sitesync_lftp_relative_path "${line##* }" "$local_base")
+				;;
+			'get '*)
+				action=$transfer_label
+				target=$(sitesync_lftp_relative_path "${line##* }" "$local_base")
+				;;
+			'mkdir '*)
+				action=mkdir
+				target=$(sitesync_lftp_relative_path "${line##* }" "$local_base")
+				;;
+			'rm '*)
+				action=delete
+				target=$(sitesync_lftp_relative_path "${line##* }" "$local_base")
+				;;
+			'chmod '*)
+				continue
+				;;
+			'Transferring file `'*)
+				action=$transfer_label
+				;;
+			'Making directory `'*)
+				action=mkdir
+				;;
+			'Removing old file `'*|'Removing old directory `'*)
+				action=delete
+				;;
+		esac
+
+		if [[ "$line" == *'`'* ]]; then
+			target="${line#*\`}"
+			target="${target%\'}"
+		fi
+
+		# mirror -v replaces a changed file as "Removing old file" + "Transferring file"
+		if [[ -n "$pending_delete" ]]; then
+			if [[ "$action" == "$transfer_label" && "$target" == "$pending_delete" ]]; then
+				action=update
+			else
+				printf '%-8s %s\n' delete "$pending_delete"
+				(( count++ ))
+			fi
+			pending_delete=""
+		fi
+
+		if [[ -z "$action" ]]; then
+			print -r -- "$line"
+			continue
+		fi
+		if [[ "$line" == 'Removing old file `'* ]]; then
+			pending_delete="$target"
+			continue
+		fi
+		printf '%-8s %s\n' "$action" "$target"
+		(( count++ ))
+	done
+
+	if [[ -n "$pending_delete" ]]; then
+		printf '%-8s %s\n' delete "$pending_delete"
+		(( count++ ))
+	fi
+
+	if (( count == 0 )); then
+		echo "No changes."
+	fi
+}
+
+sitesync_lftp_relative_path() {
+	local target="$1"
+	local local_base="$2"
+	local remote_base="${remote_path#/}"
+
+	case "$target" in
+		file:*)
+			target=$(sitesync_url_decode "${target#file:}")
+			target="${target#"$local_base"/}"
+			;;
+		sftp://*)
+			target=$(sitesync_url_decode "${target#sftp://*/}")
+			if [[ -n "$remote_base" ]]; then
+				target="${target#"$remote_base"/}"
+			fi
+			;;
+	esac
+	print -r -- "$target"
+}
+
+sitesync_url_decode() {
+	printf '%b\n' "${1//\%/\\x}"
+}
+
+sitesync_lftp_show_command() {
+	local site="$1"
+	local direction="$2"
+	local dry_run="$3"
+	local script_file
+
+	if ! sitesync_remote_parts; then
+		return 1
+	fi
+
+	script_file=$(mktemp "${TMPDIR:-/tmp}/sitesync-lftp.XXXXXX") || return 1
+	if ! sitesync_lftp_write_script "$site" "$direction" "$dry_run" "$script_file"; then
+		rm -f "$script_file"
+		return 1
+	fi
+
+	print "# save as script.lftp, then run: lftp -f script.lftp"
+	cat "$script_file"
+	rm -f "$script_file"
+}
+
+sitesync_show_status() {
+	local site="$1"
+
+	if sitesync_is_sftp "$site"; then
+		echo "Transport: SFTP (lftp)"
+	else
+		echo "Transport: SSH (rsync over ssh)"
+	fi
+	echo "Remote: $remote"
 }
 
 if [[ -z "$1" ]]; then
@@ -72,31 +384,70 @@ fi
 if [[ ! -f "$folder/$1/.rsync-port" ]]; then
 	port=22
 else
-	while read line; do 
-		port=$line
-	done < "$folder/$1/.rsync-port"
+	port=$(head -n 1 "$folder/$1/.rsync-port")
+	port=${port//$'\r'/}
+	if [[ -z "$port" ]]; then
+		port=22
+	fi
 fi
 
-while read line; do    
-    remote=$line
-done < "$folder/$1/.rsync-remote"
+remote=$(head -n 1 "$folder/$1/.rsync-remote")
+remote=${remote//$'\r'/}
+if [[ -z "$remote" ]]; then
+	echo "Missing or empty .rsync-remote for $1" >&2
+	exit 1
+fi
 
-if [[ $2 == "test" ]] then
+sftp_site=0
+filter="merge $folder/$1/.rsync-filter"
+
+if sitesync_is_sftp "$1"; then
+	sftp_site=1
+fi
+
+if [[ $2 == "status" ]]; then
+	sitesync_show_status "$1"
+	exit 0
+elif [[ $2 == "test" ]]; then
 	echo "-- Test run --"
-	sitesync_rsync -rLtDuvcin -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="merge $folder/$1/.rsync-filter" $folder/$1/ $remote --delete
-elif [[ $2 == "inittest" ]] then
+	if (( sftp_site )); then
+		sitesync_lftp_run "$1" push 1
+	else
+		sitesync_rsync -rLtDuvcin -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="$filter" $folder/$1/ $remote --delete
+	fi
+elif [[ $2 == "inittest" ]]; then
 	echo "-- Test initial run (get data from remote) --"
-	sitesync_rsync -rLtDuvcin -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="merge $folder/$1/.rsync-filter" $remote $folder/$1/ --delete
-elif [[ $2 == "init" ]] then
+	if (( sftp_site )); then
+		sitesync_lftp_run "$1" pull 1
+	else
+		sitesync_rsync -rLtDuvcin -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="$filter" $remote $folder/$1/ --delete
+	fi
+elif [[ $2 == "init" ]]; then
 	echo "-- Inital run (get data from remote) --"
-	sitesync_rsync -rLtDuvc -e "ssh -p $port" --filter="merge $folder/$1/.rsync-filter" $remote $folder/$1/ --delete
-elif [[ $2 == "command" ]] then
-	echo "rsync -e 'ssh -p $port' -rLtDuvcn --no-perms --no-owner --no-group --no-times --filter=\"merge $folder/$1/.rsync-filter\" $folder/$1/ $remote --delete | grep -E '^deleting|[^/]$|^$'"
-elif [[ $2 == "commandinit" ]] then
-	echo "rsync -rLtDuvcin -e 'ssh -p $port' --filter=\"merge $folder/$1/.rsync-filter\" $remote $folder/$1/ --delete | grep -E '^deleting|[^/]$|^$'"
-elif [[ $2 == "go" ]] then
+	if (( sftp_site )); then
+		sitesync_lftp_run "$1" pull 0
+	else
+		sitesync_rsync -rLtDuvc -e "ssh -p $port" --filter="$filter" $remote $folder/$1/ --delete
+	fi
+elif [[ $2 == "command" ]]; then
+	if (( sftp_site )); then
+		sitesync_lftp_show_command "$1" push 1
+	else
+		echo "rsync -e 'ssh -p $port' -rLtDuvcn --no-perms --no-owner --no-group --no-times --filter=\"merge $folder/$1/.rsync-filter\" $folder/$1/ $remote --delete | grep -E '^deleting|[^/]$|^$'"
+	fi
+elif [[ $2 == "commandinit" ]]; then
+	if (( sftp_site )); then
+		sitesync_lftp_show_command "$1" pull 1
+	else
+		echo "rsync -rLtDuvcin -e 'ssh -p $port' --filter=\"merge $folder/$1/.rsync-filter\" $remote $folder/$1/ --delete | grep -E '^deleting|[^/]$|^$'"
+	fi
+elif [[ $2 == "go" ]]; then
 	echo "-- Site sync --"
-	sitesync_rsync -rLtDuvc -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="merge $folder/$1/.rsync-filter" $folder/$1/ $remote --delete
+	if (( sftp_site )); then
+		sitesync_lftp_run "$1" push 0
+	else
+		sitesync_rsync -rLtDuvc -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="$filter" $folder/$1/ $remote --delete
+	fi
 else
 	echo "Unknown command: $2" >&2
 	sitesync_usage
