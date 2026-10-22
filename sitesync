@@ -413,40 +413,40 @@ elif [[ $2 == "test" ]]; then
 	if (( sftp_site )); then
 		sitesync_lftp_run "$1" push 1
 	else
-		sitesync_rsync -rLtDuvcin -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="$filter" $folder/$1/ $remote --delete
+		sitesync_rsync -rLtDvcin -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="$filter" $folder/$1/ $remote --delete
 	fi
 elif [[ $2 == "inittest" ]]; then
 	echo "-- Test initial run (get data from remote) --"
 	if (( sftp_site )); then
 		sitesync_lftp_run "$1" pull 1
 	else
-		sitesync_rsync -rLtDuvcin -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="$filter" $remote $folder/$1/ --delete
+		sitesync_rsync -rLtDvcin -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="$filter" $remote $folder/$1/ --delete
 	fi
 elif [[ $2 == "init" ]]; then
 	echo "-- Inital run (get data from remote) --"
 	if (( sftp_site )); then
 		sitesync_lftp_run "$1" pull 0
 	else
-		sitesync_rsync -rLtDuvc -e "ssh -p $port" --filter="$filter" $remote $folder/$1/ --delete
+		sitesync_rsync -rLtDvc -e "ssh -p $port" --filter="$filter" $remote $folder/$1/ --delete
 	fi
 elif [[ $2 == "command" ]]; then
 	if (( sftp_site )); then
 		sitesync_lftp_show_command "$1" push 1
 	else
-		echo "rsync -e 'ssh -p $port' -rLtDuvcn --no-perms --no-owner --no-group --no-times --filter=\"merge $folder/$1/.rsync-filter\" $folder/$1/ $remote --delete | grep -E '^deleting|[^/]$|^$'"
+		echo "rsync -e 'ssh -p $port' -rLtDvcn --no-perms --no-owner --no-group --no-times --filter=\"merge $folder/$1/.rsync-filter\" $folder/$1/ $remote --delete | grep -E '^deleting|[^/]$|^$'"
 	fi
 elif [[ $2 == "commandinit" ]]; then
 	if (( sftp_site )); then
 		sitesync_lftp_show_command "$1" pull 1
 	else
-		echo "rsync -rLtDuvcin -e 'ssh -p $port' --filter=\"merge $folder/$1/.rsync-filter\" $remote $folder/$1/ --delete | grep -E '^deleting|[^/]$|^$'"
+		echo "rsync -rLtDvcin -e 'ssh -p $port' --filter=\"merge $folder/$1/.rsync-filter\" $remote $folder/$1/ --delete | grep -E '^deleting|[^/]$|^$'"
 	fi
 elif [[ $2 == "go" ]]; then
 	echo "-- Site sync --"
 	if (( sftp_site )); then
 		sitesync_lftp_run "$1" push 0
 	else
-		sitesync_rsync -rLtDuvc -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="$filter" $folder/$1/ $remote --delete
+		sitesync_rsync -rLtDvc -e "ssh -p $port" --no-perms --no-owner --no-group --no-times --filter="$filter" $folder/$1/ $remote --delete
 	fi
 else
 	echo "Unknown command: $2" >&2
